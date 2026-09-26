@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Entry point that works from both the repository and an installation."""
+
+from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve().parent
+for candidate in (HERE.parent / "lib" / "oc-relay", HERE.parent / "src"):
+    if (candidate / "oc_relay.py").exists():
+        sys.path.insert(0, str(candidate))
+        break
+
+from oc_relay import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
