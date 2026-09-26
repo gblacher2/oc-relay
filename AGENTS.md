@@ -2,25 +2,52 @@
 
 ## Project overview
 
-Describe what the project does and the user or system it serves.
+`oc-relay` is a macOS-only, localhost reverse proxy that lets LM Studio's
+`openai-compat-endpoint` plugin call OpenCode Go. It injects the required stable
+`x-opencode-session` header while preserving streaming response delivery.
 
 ## Architecture
 
-Document important directories, modules, boundaries, data ownership, and design
-principles. Link consequential decisions in `docs/adr/` when appropriate.
+- `src/oc_relay.py`: relay server and configuration loading.
+- `bin/oc-relay`: launchd management and operator CLI.
+- `scripts/`: installer and uninstaller.
+- `launchd/`: LaunchAgent template.
+- `tests/`: stdlib unit and integration tests.
+
+The repository contains reconstruction-safe source only. Installed files,
+configuration, LaunchAgent state, logs, credentials, and API keys stay outside
+Git in the user's home directory.
 
 ## Development
 
-Document exact installation and run commands for this repository.
+Install with `./scripts/install.sh`. Operate with `~/.local/bin/oc-relay`.
+Use only the Python standard library and macOS system tools.
 
 ## Validation
 
-Document exact test, lint, typecheck, build, and manual verification commands.
-A failed required check means the task is not complete.
+Run all of the following from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q src tests
+./scripts/check.sh
+```
+
+For installed-service verification also run:
+
+```bash
+~/.local/bin/oc-relay status
+~/.local/bin/oc-relay models
+curl --fail --silent http://127.0.0.1:8788/health
+```
 
 ## Coding conventions
 
-Document project-specific language, framework, compatibility, data, and UI rules.
+- Target the system Python available on supported macOS versions.
+- Bind only to `127.0.0.1`; never add a configurable public bind address.
+- Never log request headers, response bodies, credentials, or API keys.
+- Preserve response streaming; do not buffer successful upstream responses.
+- Shell scripts use `set -euo pipefail` and pass `shellcheck` when available.
 
 ## GitHub workflow and agent guardrails
 
