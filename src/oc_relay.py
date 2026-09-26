@@ -40,6 +40,7 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+EXCLUDED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {"host"}
 
 
 def user_paths(home: Path | None = None) -> dict[str, Path]:
@@ -182,7 +183,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         headers = {
             key: value
             for key, value in self.headers.items()
-            if key.lower() not in HOP_BY_HOP_HEADERS
+            if key.lower() not in EXCLUDED_REQUEST_HEADERS
         }
         headers["x-opencode-session"] = self.server.session_id
         headers["User-Agent"] = "oc-relay/1.0"

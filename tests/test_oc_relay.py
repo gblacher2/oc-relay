@@ -152,6 +152,10 @@ class RelayIntegrationTests(unittest.TestCase):
             received_headers["x-opencode-session"], self.relay.session_id
         )
         self.assertEqual(
+            received_headers["host"],
+            f"127.0.0.1:{self.upstream.server_port}",
+        )
+        self.assertEqual(
             json.loads(UpstreamHandler.received_body),
             {"messages": [], "model": "fallback-model"},
         )
