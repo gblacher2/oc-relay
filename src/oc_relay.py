@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -292,7 +293,7 @@ def launchctl_loaded() -> bool:
     return result.returncode == 0
 
 
-def start_service() -> int:
+def start_service(config: dict[str, Any]) -> int:
     plist = user_paths()["plist"]
     if not plist.exists():
         print(f"LaunchAgent is not installed: {plist}", file=sys.stderr)
@@ -301,7 +302,15 @@ def start_service() -> int:
         command = ["launchctl", "kickstart", "-k", f"{launchctl_domain()}/{LABEL}"]
     else:
         command = ["launchctl", "bootstrap", launchctl_domain(), str(plist)]
-    return subprocess.run(command, check=False).returncode
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        return result.returncode
+    for _ in range(20):
+        if health(config):
+            return 0
+        time.sleep(0.25)
+    print("oc-relay was loaded but did not become healthy", file=sys.stderr)
+    return 1
 
 
 def stop_service() -> int:
@@ -313,9 +322,9 @@ def stop_service() -> int:
     ).returncode
 
 
-def restart_service() -> int:
+def restart_service(config: dict[str, Any]) -> int:
     result = stop_service()
-    return start_service() if result == 0 else result
+    return start_service(config) if result == 0 else result
 
 
 def health(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -416,11 +425,11 @@ def main(argv: list[str] | None = None) -> int:
         run_server(config)
         return 0
     if args.command == "start":
-        return start_service()
+        return start_service(config)
     if args.command == "stop":
         return stop_service()
     if args.command == "restart":
-        return restart_service()
+        return restart_service(config)
     if args.command == "status":
         return status_service(config)
     if args.command == "logs":
