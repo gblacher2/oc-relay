@@ -10,8 +10,10 @@ import logging
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -41,15 +43,103 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 EXCLUDED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {"host"}
+MODEL_SELECTION_VERSION = 1
+# Models documented by OpenCode Go on /chat/completions (2026-09-27).
+CHAT_COMPLETION_MODELS = (
+    "glm-5.3-flash",
+    "glm-5.3",
+    "glm-5.2",
+    "glm-5.1",
+    "kimi-k3",
+    "kimi-k2.7-code",
+    "kimi-k2.6",
+    "longcat-2.0",
+    "deepseek-v4.1-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "mimo-v2.6-flash",
+    "mimo-v2.6-pro",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "hy4-preview",
+    "hy3",
+    "space-bunny-free",
+    "longcat-2.5-preview-free",
+)
+CHAT_COMPLETION_MODEL_SET = frozenset(CHAT_COMPLETION_MODELS)
+
+
+class ModelSelectionError(ValueError):
+    """A non-secret model selection cannot be read or applied safely."""
 
 
 def user_paths(home: Path | None = None) -> dict[str, Path]:
     home = home or Path.home()
     return {
         "config": home / ".config" / "oc-relay" / "config.json",
+        "selection": home / ".local" / "state" / "oc-relay" / "selected-model",
         "log": home / "Library" / "Logs" / "oc-relay.log",
         "plist": home / "Library" / "LaunchAgents" / f"{LABEL}.plist",
     }
+
+
+def read_selected_model(path: Path) -> str | None:
+    try:
+        if path.is_symlink():
+            raise ModelSelectionError("invalid model selection state")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            raise ModelSelectionError("invalid model selection state")
+        value = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise ModelSelectionError("model selection unavailable") from exc
+    if value.endswith("\n"):
+        value = value[:-1]
+    if value not in CHAT_COMPLETION_MODEL_SET:
+        raise ModelSelectionError("invalid model selection state")
+    return value
+
+
+def write_selected_model(path: Path, model: str) -> None:
+    if model not in CHAT_COMPLETION_MODEL_SET:
+        raise ModelSelectionError("unsupported Chat Completions model")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".selected-model-", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(model + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def clear_selected_model(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def apply_selected_model(body: bytes | None, content_type: str, model: str) -> bytes:
+    if body is None or "application/json" not in content_type.lower():
+        raise ModelSelectionError("Chat Completions requires a JSON body")
+    try:
+        payload = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ModelSelectionError("invalid Chat Completions JSON") from exc
+    if not isinstance(payload, dict):
+        raise ModelSelectionError("Chat Completions body must be an object")
+    payload["model"] = model
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
@@ -109,10 +199,12 @@ class RelayServer(http.server.ThreadingHTTPServer):
         server_address: tuple[str, int],
         config: dict[str, Any],
         logger: logging.Logger,
+        selection_path: Path | None = None,
     ) -> None:
         super().__init__(server_address, RelayHandler)
         self.target_url = config["target_url"]
         self.fallback_model = config.get("fallback_model")
+        self.selection_path = selection_path or user_paths()["selection"]
         self.session_id = str(uuid.uuid4())
         self.logger = logger
 
@@ -158,6 +250,12 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _health(self) -> None:
+        try:
+            selected = read_selected_model(self.server.selection_path)
+            selection_error = None
+        except ModelSelectionError:
+            selected = None
+            selection_error = "unavailable"
         self._send_json(
             200,
             {
@@ -165,6 +263,12 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 "pid": os.getpid(),
                 "port": self.server.server_port,
                 "target_url": self.server.target_url,
+                "model_selection": {
+                    "version": MODEL_SELECTION_VERSION,
+                    "selected": selected,
+                    "models": CHAT_COMPLETION_MODELS,
+                    "error": selection_error,
+                },
             },
         )
 
@@ -175,11 +279,28 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
 
-        raw_body = apply_fallback_model(
-            raw_body,
-            self.headers.get("Content-Type", ""),
-            self.server.fallback_model,
-        )
+        route = urllib.parse.urlsplit(self.path).path
+        selected = None
+        if self.command == "POST" and route == "/chat/completions":
+            try:
+                selected = read_selected_model(self.server.selection_path)
+            except ModelSelectionError:
+                self._send_json(503, {"error": "model selection unavailable"})
+                return
+            if selected is not None:
+                try:
+                    raw_body = apply_selected_model(
+                        raw_body, self.headers.get("Content-Type", ""), selected
+                    )
+                except ModelSelectionError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+        if self.command != "POST" or route != "/chat/completions" or selected is None:
+            raw_body = apply_fallback_model(
+                raw_body,
+                self.headers.get("Content-Type", ""),
+                self.server.fallback_model,
+            )
         headers = {
             key: value
             for key, value in self.headers.items()
@@ -401,6 +522,35 @@ def list_models(config: dict[str, Any]) -> int:
     return 0
 
 
+def model_command(args: argparse.Namespace) -> int:
+    path = user_paths()["selection"]
+    try:
+        if args.model_command == "list":
+            print(json.dumps({
+                "version": MODEL_SELECTION_VERSION,
+                "models": CHAT_COMPLETION_MODELS,
+            }))
+        elif args.model_command == "show":
+            print(json.dumps({
+                "version": MODEL_SELECTION_VERSION,
+                "selected": read_selected_model(path),
+            }))
+        elif args.model_command == "set":
+            write_selected_model(path, args.model_id)
+        elif args.model_command == "clear":
+            clear_selected_model(path)
+        else:
+            return 2
+    except (ModelSelectionError, OSError) as exc:
+        reason = (
+            str(exc) if isinstance(exc, ModelSelectionError)
+            else "model selection unavailable"
+        )
+        print(f"oc-relay: {reason}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="oc-relay")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -412,11 +562,26 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser = subparsers.add_parser("logs", help="show service logs")
     logs_parser.add_argument("-f", "--follow", action="store_true")
     subparsers.add_parser("models", help="print live OpenCode Go model IDs")
+    model_parser = subparsers.add_parser(
+        "model", help="manage the global Chat Completions model"
+    )
+    model_commands = model_parser.add_subparsers(dest="model_command", required=True)
+    model_commands.add_parser(
+        "list", help="print supported model IDs as JSON"
+    ).add_argument("--json", action="store_true")
+    model_commands.add_parser(
+        "show", help="print selected model as JSON"
+    ).add_argument("--json", action="store_true")
+    model_set = model_commands.add_parser("set", help="select a global model")
+    model_set.add_argument("model_id")
+    model_commands.add_parser("clear", help="use the client model")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "model":
+        return model_command(args)
     try:
         config = load_config()
     except ValueError as exc:

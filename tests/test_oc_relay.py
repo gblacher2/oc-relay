@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -19,7 +20,13 @@ from oc_relay import (  # noqa: E402
     DEFAULT_TARGET,
     RelayServer,
     apply_fallback_model,
+    apply_selected_model,
+    clear_selected_model,
     load_config,
+    read_selected_model,
+    write_selected_model,
+    ModelSelectionError,
+    main,
 )
 
 
@@ -40,11 +47,50 @@ class ConfigTests(unittest.TestCase):
             apply_fallback_model(existing, "application/json", "model-a"), existing
         )
 
+    def test_selected_model_persists_and_rejects_unsupported_or_corrupt_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state" / "selected-model"
+            self.assertIsNone(read_selected_model(path))
+            write_selected_model(path, "mimo-v2.6-flash")
+            self.assertEqual(read_selected_model(path), "mimo-v2.6-flash")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            with self.assertRaises(ModelSelectionError):
+                write_selected_model(path, "minimax-m3")
+            path.write_text("unknown-model\n", encoding="utf-8")
+            with self.assertRaises(ModelSelectionError):
+                read_selected_model(path)
+            path.write_text("mimo-v2.6-flash\n", encoding="utf-8")
+            path.chmod(0o644)
+            with self.assertRaises(ModelSelectionError):
+                read_selected_model(path)
+            clear_selected_model(path)
+            self.assertIsNone(read_selected_model(path))
+
+    def test_model_cli_rejects_messages_models_and_clears_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("oc_relay.user_paths", return_value={"selection": Path(directory) / "selected-model"}):
+                self.assertEqual(main(["model", "set", "minimax-m3"]), 1)
+                self.assertEqual(main(["model", "set", "glm-5.3"]), 0)
+                self.assertEqual(read_selected_model(Path(directory) / "selected-model"), "glm-5.3")
+                self.assertEqual(main(["model", "clear"]), 0)
+                self.assertIsNone(read_selected_model(Path(directory) / "selected-model"))
+
+    def test_selected_model_changes_only_model_field(self) -> None:
+        body = b'{"model":"client-model","messages":[],"stream":true}'
+        changed = apply_selected_model(body, "application/json", "kimi-k2.7-code")
+        self.assertEqual(json.loads(changed), {
+            "model": "kimi-k2.7-code", "messages": [], "stream": True,
+        })
+        with self.assertRaises(ModelSelectionError):
+            apply_selected_model(b"not JSON", "application/json", "kimi-k2.7-code")
+
 
 class UpstreamHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     received_headers: dict[str, str] = {}
     received_body = b""
+    received_bodies: list[bytes] = []
     first_sent = threading.Event()
     release_second = threading.Event()
 
@@ -52,6 +98,7 @@ class UpstreamHandler(http.server.BaseHTTPRequestHandler):
         type(self).received_headers = dict(self.headers.items())
         length = int(self.headers.get("Content-Length", "0"))
         type(self).received_body = self.rfile.read(length)
+        type(self).received_bodies.append(type(self).received_body)
         first = b"data: first\n\n"
         second = b"data: second\n\n"
         self.send_response(200)
@@ -72,6 +119,7 @@ class RelayIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         UpstreamHandler.received_headers = {}
         UpstreamHandler.received_body = b""
+        UpstreamHandler.received_bodies = []
         UpstreamHandler.first_sent.clear()
         UpstreamHandler.release_second.clear()
         self.upstream = http.server.ThreadingHTTPServer(
@@ -90,7 +138,12 @@ class RelayIntegrationTests(unittest.TestCase):
             "target_url": f"http://127.0.0.1:{self.upstream.server_port}",
             "fallback_model": "fallback-model",
         }
-        self.relay = RelayServer(("127.0.0.1", 0), config, logger)
+        self.state_directory = tempfile.TemporaryDirectory()
+        self.selection_path = Path(self.state_directory.name) / "selected-model"
+        self.relay = RelayServer(
+            ("127.0.0.1", 0), config, logger,
+            selection_path=self.selection_path,
+        )
         self.relay_thread = threading.Thread(target=self.relay.serve_forever, daemon=True)
         self.relay_thread.start()
 
@@ -100,6 +153,7 @@ class RelayIntegrationTests(unittest.TestCase):
         self.relay.server_close()
         self.upstream.shutdown()
         self.upstream.server_close()
+        self.state_directory.cleanup()
 
     def test_health_is_local_and_reports_runtime(self) -> None:
         with urllib.request.urlopen(
@@ -108,6 +162,9 @@ class RelayIntegrationTests(unittest.TestCase):
             payload = json.load(response)
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["port"], self.relay.server_port)
+        self.assertEqual(payload["model_selection"]["version"], 1)
+        self.assertIsNone(payload["model_selection"]["selected"])
+        self.assertIn("mimo-v2.6-flash", payload["model_selection"]["models"])
         self.assertEqual(self.relay.server_address[0], "127.0.0.1")
 
     def test_injects_headers_applies_fallback_and_streams_incrementally(self) -> None:
@@ -162,6 +219,52 @@ class RelayIntegrationTests(unittest.TestCase):
         logs = self.log_stream.getvalue()
         self.assertNotIn("test-secret", logs)
         self.assertNotIn("trace=not-logged", logs)
+
+    def test_selection_overrides_next_chat_request_but_not_other_routes(self) -> None:
+        write_selected_model(self.selection_path, "mimo-v2.6-flash")
+        connection = http.client.HTTPConnection("127.0.0.1", self.relay.server_port, timeout=3)
+        connection.request(
+            "POST", "/chat/completions",
+            body=b'{"model":"client-model","messages":[],"stream":true}',
+            headers={"Content-Type": "application/json"},
+        )
+        first = connection.getresponse()
+        self.assertTrue(UpstreamHandler.first_sent.wait(1))
+        self.assertEqual(json.loads(UpstreamHandler.received_bodies[0])["model"], "mimo-v2.6-flash")
+
+        write_selected_model(self.selection_path, "kimi-k2.7-code")
+        second_connection = http.client.HTTPConnection("127.0.0.1", self.relay.server_port, timeout=3)
+        second_connection.request(
+            "POST", "/chat/completions",
+            body=b'{"model":"client-model","messages":[],"stream":true}',
+            headers={"Content-Type": "application/json"},
+        )
+        second = second_connection.getresponse()
+        self.assertEqual(json.loads(UpstreamHandler.received_bodies[1])["model"], "kimi-k2.7-code")
+        UpstreamHandler.release_second.set()
+        self.assertIn(b"data: second", first.read())
+        second.read()
+        connection.close()
+        second_connection.close()
+
+        other_connection = http.client.HTTPConnection("127.0.0.1", self.relay.server_port, timeout=3)
+        other_connection.request(
+            "POST", "/responses", body=b'{"model":"client-model"}',
+            headers={"Content-Type": "application/json"},
+        )
+        other_connection.getresponse().read()
+        self.assertEqual(json.loads(UpstreamHandler.received_bodies[2])["model"], "client-model")
+        other_connection.close()
+
+        clear_selected_model(self.selection_path)
+        passthrough = http.client.HTTPConnection("127.0.0.1", self.relay.server_port, timeout=3)
+        passthrough.request(
+            "POST", "/chat/completions", body=b'{"model":"client-model"}',
+            headers={"Content-Type": "application/json"},
+        )
+        passthrough.getresponse().read()
+        self.assertEqual(json.loads(UpstreamHandler.received_bodies[3])["model"], "client-model")
+        passthrough.close()
 
 
 if __name__ == "__main__":

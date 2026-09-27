@@ -9,6 +9,9 @@
 ## Architecture
 
 - `src/oc_relay.py`: relay server and configuration loading.
+- The typed `oc-relay model` CLI stores only a model ID in an owner-only state
+  file. The relay reads it per Chat Completions request without restarting or
+  exposing a writable HTTP control endpoint.
 - `bin/oc-relay`: launchd management and operator CLI.
 - `scripts/`: installer and uninstaller.
 - `launchd/`: LaunchAgent template.
@@ -47,6 +50,8 @@ curl --fail --silent http://127.0.0.1:8788/health
 - Bind only to `127.0.0.1`; never add a configurable public bind address.
 - Never log request headers, response bodies, credentials, or API keys.
 - Preserve response streaming; do not buffer successful upstream responses.
+- Apply a selected model only to future `POST /chat/completions` requests.
+  Reject unsupported IDs; never translate Messages or Responses implicitly.
 - Shell scripts use `set -euo pipefail` and pass `shellcheck` when available.
 
 ## GitHub workflow and agent guardrails
