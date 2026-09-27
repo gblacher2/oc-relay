@@ -35,11 +35,25 @@ oc-relay status
 oc-relay logs
 oc-relay logs --follow
 oc-relay models
+oc-relay model list --json
+oc-relay model show --json
+oc-relay model set mimo-v2.6-flash
+oc-relay model clear
 ```
 
 `status` shows launchd state, health, port, PID, paths, and the last ten log
 lines. The local endpoint `http://127.0.0.1:8788/health` returns JSON health
 information.
+
+`model set` applies a global model to future `POST /chat/completions` requests,
+including requests where LM Studio supplies an explicit model. It does not change
+LM Studio's visible Custom Model field or an already streaming request. `model
+clear` restores the client's model. The choice is stored as a non-secret ID in
+`~/.local/state/oc-relay/selected-model` and survives relay restarts. The
+supported catalog contains only Go models documented for Chat Completions;
+Messages and Responses models are excluded. Catalog presence does not prove
+account access. `/health` reports the safe catalog, selected ID, and capability
+version for RelayKey. No model-selection HTTP write endpoint exists.
 
 ## Configure
 
