@@ -44,7 +44,7 @@ Document project-specific language, framework, compatibility, data, and UI rules
 
 This repository runs on GitHub Actions with a limited monthly minute quota. Agents must follow these rules.
 
-- Commit work in progress with `[skip ci]` in the message. Never use `[skip ci]` on the final commit of a pull request, or its checks will not run.
+- Commit work in progress with `[skip ci]` in the message. Never use `[skip ci]` on the final commit of a pull request, or its checks will not run. With squash merges, GitHub joins the commit messages: make sure the merge commit message on the default branch does not contain `[skip ci]`.
 - Batch related edits into one push instead of pushing after every change.
 - Do not add `on: push` triggers for all branches. Use `workflow_dispatch` for experiments.
 - Do not add or change a scheduled workflow without asking Gabriel first.
