@@ -39,3 +39,14 @@ Document project-specific language, framework, compatibility, data, and UI rules
   logs, or machine-specific state. Commit reconstruction-safe examples and setup docs.
 - Push meaningful checkpoints and keep the PR accurate so a fresh agent can continue
   from GitHub alone.
+
+## CI minutes policy
+
+This repository runs on GitHub Actions with a limited monthly minute quota. Agents must follow these rules.
+
+- Commit work in progress with `[skip ci]` in the message. Never use `[skip ci]` on the final commit of a pull request, or its checks will not run.
+- Batch related edits into one push instead of pushing after every change.
+- Do not add `on: push` triggers for all branches. Use `workflow_dispatch` for experiments.
+- Do not add or change a scheduled workflow without asking Gabriel first.
+- Before adding any workflow, state its expected runs per month.
+- Keep `concurrency` with `cancel-in-progress: true` on pull request workflows, and use `ubuntu-latest` unless macOS or Windows is required.
